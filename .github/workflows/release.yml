@@ -1,0 +1,70 @@
+# Publishes provider release assets when a version tag is pushed.
+# Requires secret GPG_PRIVATE_KEY. PASSPHRASE is optional (omit for passphrase-less keys).
+name: release
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Detect GPG passphrase
+        id: gpg_pass
+        env:
+          PASSPHRASE: ${{ secrets.PASSPHRASE }}
+        run: |
+          if [ -n "${PASSPHRASE}" ]; then
+            echo "has_passphrase=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_passphrase=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Import GPG key
+        if: steps.gpg_pass.outputs.has_passphrase == 'false'
+        uses: crazy-max/ghaction-import-gpg@e89d81abc06cb3199b8577a6c3747a59ac679818 # v6.3.0
+        id: import_gpg_nopw
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+
+      - name: Import GPG key (with passphrase)
+        if: steps.gpg_pass.outputs.has_passphrase == 'true'
+        uses: crazy-max/ghaction-import-gpg@e89d81abc06cb3199b8577a6c3747a59ac679818 # v6.3.0
+        id: import_gpg_pw
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.PASSPHRASE }}
+
+      - name: Set GPG fingerprint
+        id: import_gpg
+        run: |
+          fp="${{ steps.import_gpg_nopw.outputs.fingerprint }}${{ steps.import_gpg_pw.outputs.fingerprint }}"
+          if [ -z "$fp" ]; then
+            echo "GPG fingerprint missing; ensure GPG_PRIVATE_KEY is set" >&2
+            exit 1
+          fi
+          echo "fingerprint=$fp" >> "$GITHUB_OUTPUT"
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a38 # v6.3.0
+        with:
+          version: '~> v2'
+          args: release --clean
+        env:
+          GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
