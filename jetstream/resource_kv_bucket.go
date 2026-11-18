@@ -462,6 +462,8 @@ func resourceKVBucketUpdate(d *schema.ResourceData, m any) error {
 	cfg.MaxMsgsPerSubject = int64(history)
 	cfg.MaxAge = time.Duration(ttl) * time.Second
 	cfg.MaxBytes = int64(maxB)
+	// Apply configured replicas (v0.4.0 copied live Replicas and never
+	// updated; upstream fix df44c21). Required so 1→3 reaches the server.
 	cfg.Replicas = replicas
 	cfg.Placement = kvBucketPlacement(d)
 	cfg.SubjectDeleteMarkerTTL = time.Duration(markerTTL) * time.Second

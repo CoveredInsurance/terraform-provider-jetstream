@@ -151,18 +151,77 @@ func TestResourceKVPreserveStreamFlagsOnUpdate(t *testing.T) {
 				Check: resource.ComposeTestCheckFunc(
 					testBucketExist(t, mgr, "TEST"),
 					testBucketStreamFlags(t, nc, "TEST", false, false),
+					testBucketStreamReplicas(t, nc, "TEST", 1),
 					resource.TestCheckResourceAttr("jetstream_kv_bucket.test", "allow_direct", "false"),
 					resource.TestCheckResourceAttr("jetstream_kv_bucket.test", "deny_delete", "false"),
 					resource.TestCheckResourceAttr("jetstream_kv_bucket.test", "replicas", "1"),
 				),
 			},
 			{
+				// replicas 1→3 must reach the server (v0.4.0 bug / upstream df44c21)
+				// and must not flip allow_direct / deny_delete.
 				Config: fmt.Sprintf(testKV_preserveFlags, nc.ConnectedUrl(), 3),
 				Check: resource.ComposeTestCheckFunc(
 					testBucketExist(t, mgr, "TEST"),
 					testBucketStreamFlags(t, nc, "TEST", false, false),
+					testBucketStreamReplicas(t, nc, "TEST", 3),
 					resource.TestCheckResourceAttr("jetstream_kv_bucket.test", "allow_direct", "false"),
 					resource.TestCheckResourceAttr("jetstream_kv_bucket.test", "deny_delete", "false"),
+					resource.TestCheckResourceAttr("jetstream_kv_bucket.test", "replicas", "3"),
+				),
+			},
+		},
+	})
+}
+
+const testKV_replicas = `
+provider "jetstream" {
+  servers = "%s"
+}
+
+resource "jetstream_kv_bucket" "test" {
+  name     = "TEST"
+  storage  = "memory"
+  history  = 5
+  replicas = %d
+}
+`
+
+func TestResourceKVReplicasUpdate(t *testing.T) {
+	srv := createJSServer(t)
+	defer srv.Shutdown()
+
+	nc, err := nats.Connect(srv.ClientURL())
+	if err != nil {
+		t.Fatalf("could not connect: %s", err)
+	}
+	defer nc.Close()
+
+	mgr, err := jsm.New(nc)
+	if err != nil {
+		t.Fatalf("could not connect: %s", err)
+	}
+
+	// Single-node JetStream accepts num_replicas updates into stream config
+	// (verified against nats-server 2.11+/2.14); assert live StreamInfo, not
+	// only Terraform state, so a recurring plan bug cannot hide here.
+	resource.Test(t, resource.TestCase{
+		ProviderFactories: testJsProviders,
+		CheckDestroy:      testBucketDoesNotExist(t, mgr, "TEST"),
+		Steps: []resource.TestStep{
+			{
+				Config: fmt.Sprintf(testKV_replicas, nc.ConnectedUrl(), 1),
+				Check: resource.ComposeTestCheckFunc(
+					testBucketExist(t, mgr, "TEST"),
+					testBucketStreamReplicas(t, nc, "TEST", 1),
+					resource.TestCheckResourceAttr("jetstream_kv_bucket.test", "replicas", "1"),
+				),
+			},
+			{
+				Config: fmt.Sprintf(testKV_replicas, nc.ConnectedUrl(), 3),
+				Check: resource.ComposeTestCheckFunc(
+					testBucketExist(t, mgr, "TEST"),
+					testBucketStreamReplicas(t, nc, "TEST", 3),
 					resource.TestCheckResourceAttr("jetstream_kv_bucket.test", "replicas", "3"),
 				),
 			},
@@ -322,18 +381,7 @@ func testBucketExist(t *testing.T, mgr *jsm.Manager, bucket string) resource.Tes
 func testBucketStreamFlags(t *testing.T, nc *nats.Conn, bucket string, allowDirect, denyDelete bool) resource.TestCheckFunc {
 	t.Helper()
 	return func(s *terraform.State) error {
-		js, err := jetstream.New(nc)
-		if err != nil {
-			return err
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		str, err := js.Stream(ctx, "KV_"+bucket)
-		if err != nil {
-			return err
-		}
-		info, err := str.Info(ctx)
+		info, err := kvBucketStreamInfo(nc, bucket)
 		if err != nil {
 			return err
 		}
@@ -345,4 +393,33 @@ func testBucketStreamFlags(t *testing.T, nc *nats.Conn, bucket string, allowDire
 		}
 		return nil
 	}
+}
+
+func testBucketStreamReplicas(t *testing.T, nc *nats.Conn, bucket string, replicas int) resource.TestCheckFunc {
+	t.Helper()
+	return func(s *terraform.State) error {
+		info, err := kvBucketStreamInfo(nc, bucket)
+		if err != nil {
+			return err
+		}
+		if info.Config.Replicas != replicas {
+			return fmt.Errorf("replicas: want %d, got %d", replicas, info.Config.Replicas)
+		}
+		return nil
+	}
+}
+
+func kvBucketStreamInfo(nc *nats.Conn, bucket string) (*jetstream.StreamInfo, error) {
+	js, err := jetstream.New(nc)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	str, err := js.Stream(ctx, "KV_"+bucket)
+	if err != nil {
+		return nil, err
+	}
+	return str.Info(ctx)
 }
