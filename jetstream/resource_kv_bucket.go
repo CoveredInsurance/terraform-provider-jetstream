@@ -142,16 +142,65 @@ func resourceKVBucketCustomizeDiff(ctx context.Context, d *schema.ResourceDiff, 
 	}
 	v := raw.GetAttr("deny_delete")
 	if v.IsNull() || !v.IsKnown() {
-		return nil
-	}
-	if !d.HasChange("deny_delete") {
-		return nil
+		return validateKVBucketDenyDeleteChange(false, false, false)
 	}
 	old, _ := d.GetChange("deny_delete")
-	if old.(bool) && !v.True() {
+	oldVal, _ := old.(bool)
+	return validateKVBucketDenyDeleteChange(oldVal, v.True(), true)
+}
+
+// validateKVBucketDenyDeleteChange rejects disabling deny_delete once enabled.
+// When newSet is false the attribute is unset in config and the live value is kept.
+func validateKVBucketDenyDeleteChange(oldDenyDelete, newDenyDelete, newSet bool) error {
+	if !newSet {
+		return nil
+	}
+	if oldDenyDelete && !newDenyDelete {
 		return fmt.Errorf("deny_delete cannot be changed from true to false: the NATS server forbids disabling deny_delete once enabled")
 	}
 	return nil
+}
+
+// kvBucketStreamUpdate holds TF-managed fields applied onto a live stream config.
+type kvBucketStreamUpdate struct {
+	Description    string
+	MaxMsgSize     int32
+	History        int64
+	MaxAge         time.Duration
+	MaxBytes       int64
+	Replicas       int
+	Placement      *jetstream.Placement
+	MarkerTTL      time.Duration
+	AllowDirect    bool
+	AllowDirectSet bool
+	DenyDelete     bool
+	DenyDeleteSet  bool
+}
+
+// mergeKVBucketStreamUpdate copies live, applies TF-managed fields, and only
+// overrides allow_direct / deny_delete when those attributes are set in config.
+func mergeKVBucketStreamUpdate(live jetstream.StreamConfig, u kvBucketStreamUpdate) jetstream.StreamConfig {
+	cfg := live
+	cfg.Description = u.Description
+	cfg.MaxMsgSize = u.MaxMsgSize
+	cfg.MaxMsgsPerSubject = u.History
+	cfg.MaxAge = u.MaxAge
+	cfg.MaxBytes = u.MaxBytes
+	// Apply configured replicas (v0.4.0 copied live Replicas and never
+	// updated; upstream fix df44c21). Required so 1→3 reaches the server.
+	cfg.Replicas = u.Replicas
+	cfg.Placement = u.Placement
+	cfg.SubjectDeleteMarkerTTL = u.MarkerTTL
+	if u.MarkerTTL > 0 {
+		cfg.AllowMsgTTL = true
+	}
+	if u.AllowDirectSet {
+		cfg.AllowDirect = u.AllowDirect
+	}
+	if u.DenyDeleteSet {
+		cfg.DenyDelete = u.DenyDelete
+	}
+	return cfg
 }
 
 // kvBucketConfigBool returns the configured value for an Optional+Computed bool
@@ -444,39 +493,22 @@ func resourceKVBucketUpdate(d *schema.ResourceData, m any) error {
 		return err
 	}
 
-	// Start from the live stream config so unmanaged fields (allow_direct,
-	// deny_delete, deny_purge, allow_rollup, discard, compression, republish,
-	// mirror/sources, metadata, duplicates, etc.) are preserved exactly.
-	cfg := info.Config
-
-	history := d.Get("history").(int)
-	ttl := d.Get("ttl").(int)
-	maxV := d.Get("max_value_size").(int)
-	maxB := d.Get("max_bucket_size").(int)
-	description := d.Get("description").(string)
-	markerTTL := d.Get("limit_marker_ttl").(int)
-	replicas := d.Get("replicas").(int)
-
-	cfg.Description = description
-	cfg.MaxMsgSize = int32(maxV)
-	cfg.MaxMsgsPerSubject = int64(history)
-	cfg.MaxAge = time.Duration(ttl) * time.Second
-	cfg.MaxBytes = int64(maxB)
-	// Apply configured replicas (v0.4.0 copied live Replicas and never
-	// updated; upstream fix df44c21). Required so 1→3 reaches the server.
-	cfg.Replicas = replicas
-	cfg.Placement = kvBucketPlacement(d)
-	cfg.SubjectDeleteMarkerTTL = time.Duration(markerTTL) * time.Second
-	if markerTTL > 0 {
-		cfg.AllowMsgTTL = true
-	}
-
-	if v, set := kvBucketConfigBool(d, "allow_direct"); set {
-		cfg.AllowDirect = v
-	}
-	if v, set := kvBucketConfigBool(d, "deny_delete"); set {
-		cfg.DenyDelete = v
-	}
+	allowDirect, allowDirectSet := kvBucketConfigBool(d, "allow_direct")
+	denyDelete, denyDeleteSet := kvBucketConfigBool(d, "deny_delete")
+	cfg := mergeKVBucketStreamUpdate(info.Config, kvBucketStreamUpdate{
+		Description:    d.Get("description").(string),
+		MaxMsgSize:     int32(d.Get("max_value_size").(int)),
+		History:        int64(d.Get("history").(int)),
+		MaxAge:         time.Duration(d.Get("ttl").(int)) * time.Second,
+		MaxBytes:       int64(d.Get("max_bucket_size").(int)),
+		Replicas:       d.Get("replicas").(int),
+		Placement:      kvBucketPlacement(d),
+		MarkerTTL:      time.Duration(d.Get("limit_marker_ttl").(int)) * time.Second,
+		AllowDirect:    allowDirect,
+		AllowDirectSet: allowDirectSet,
+		DenyDelete:     denyDelete,
+		DenyDeleteSet:  denyDeleteSet,
+	})
 
 	_, err = js.UpdateStream(ctx, cfg)
 	if err != nil {
