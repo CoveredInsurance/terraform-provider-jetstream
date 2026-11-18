@@ -34,6 +34,7 @@ func resourceKVBucket() *schema.Resource {
 		Importer: &schema.ResourceImporter{
 			StateContext: schema.ImportStatePassthroughContext,
 		},
+		CustomizeDiff: resourceKVBucketCustomizeDiff,
 
 		Schema: map[string]*schema.Schema{
 			"name": {
@@ -118,8 +119,161 @@ func resourceKVBucket() *schema.Resource {
 				Default:      0,
 				ValidateFunc: validation.IntAtLeast(0),
 			},
+			"allow_direct": {
+				Type:        schema.TypeBool,
+				Description: "Allow direct get on the backing stream. When unset, the live stream value is preserved.",
+				Optional:    true,
+				Computed:    true,
+			},
+			"deny_delete": {
+				Type:        schema.TypeBool,
+				Description: "Restrict deleting messages from the backing stream via the API. Cannot be changed from true to false. When unset, the live stream value is preserved.",
+				Optional:    true,
+				Computed:    true,
+			},
 		},
 	}
+}
+
+func resourceKVBucketCustomizeDiff(ctx context.Context, d *schema.ResourceDiff, meta any) error {
+	raw := d.GetRawConfig()
+	if raw.IsNull() {
+		return nil
+	}
+	v := raw.GetAttr("deny_delete")
+	if v.IsNull() || !v.IsKnown() {
+		return nil
+	}
+	if !d.HasChange("deny_delete") {
+		return nil
+	}
+	old, _ := d.GetChange("deny_delete")
+	if old.(bool) && !v.True() {
+		return fmt.Errorf("deny_delete cannot be changed from true to false: the NATS server forbids disabling deny_delete once enabled")
+	}
+	return nil
+}
+
+// kvBucketConfigBool returns the configured value for an Optional+Computed bool
+// and whether it was set in Terraform configuration (not merely present in state).
+func kvBucketConfigBool(d *schema.ResourceData, key string) (bool, bool) {
+	raw := d.GetRawConfig()
+	if raw.IsNull() {
+		return false, false
+	}
+	v := raw.GetAttr(key)
+	if v.IsNull() || !v.IsKnown() {
+		return false, false
+	}
+	return v.True(), true
+}
+
+func kvBucketPlacement(d *schema.ResourceData) *jetstream.Placement {
+	c, ok := d.GetOk("placement_cluster")
+	if !ok {
+		return nil
+	}
+	placement := &jetstream.Placement{Cluster: c.(string)}
+	pt, ok := d.GetOk("placement_tags")
+	if ok {
+		ts := pt.([]any)
+		tags := make([]string, len(ts))
+		for i, tag := range ts {
+			tags[i] = tag.(string)
+		}
+		placement.Tags = tags
+	}
+	return placement
+}
+
+func kvBucketStorage(d *schema.ResourceData) jetstream.StorageType {
+	switch d.Get("storage").(string) {
+	case "memory":
+		return jetstream.MemoryStorage
+	default:
+		return jetstream.FileStorage
+	}
+}
+
+// kvBucketStreamConfig builds a JetStream stream config matching nats.go KV
+// defaults (ADR-8), then applies explicitly configured allow_direct / deny_delete.
+func kvBucketStreamConfig(d *schema.ResourceData) jetstream.StreamConfig {
+	name := d.Get("name").(string)
+	history := d.Get("history").(int)
+	ttl := time.Duration(d.Get("ttl").(int)) * time.Second
+	maxV := d.Get("max_value_size").(int)
+	maxB := d.Get("max_bucket_size").(int)
+	replicas := d.Get("replicas").(int)
+	description := d.Get("description").(string)
+	markerTTL := time.Duration(d.Get("limit_marker_ttl").(int)) * time.Second
+
+	duplicateWindow := 2 * time.Minute
+	if ttl > 0 && ttl < duplicateWindow {
+		duplicateWindow = ttl
+	}
+
+	scfg := jetstream.StreamConfig{
+		Name:                   fmt.Sprintf("KV_%s", name),
+		Subjects:               []string{fmt.Sprintf("$KV.%s.>", name)},
+		Description:            description,
+		MaxMsgsPerSubject:      int64(history),
+		MaxBytes:               int64(maxB),
+		MaxAge:                 ttl,
+		MaxMsgSize:             int32(maxV),
+		Storage:                kvBucketStorage(d),
+		Replicas:               replicas,
+		Placement:              kvBucketPlacement(d),
+		AllowRollup:            true,
+		DenyDelete:             true,
+		Duplicates:             duplicateWindow,
+		MaxMsgs:                -1,
+		MaxConsumers:           -1,
+		AllowDirect:            true,
+		Discard:                jetstream.DiscardNew,
+		AllowMsgTTL:            markerTTL > 0,
+		SubjectDeleteMarkerTTL: markerTTL,
+	}
+
+	if v, set := kvBucketConfigBool(d, "allow_direct"); set {
+		scfg.AllowDirect = v
+	}
+	if v, set := kvBucketConfigBool(d, "deny_delete"); set {
+		scfg.DenyDelete = v
+	}
+
+	return scfg
+}
+
+func applyKVBucketStreamFlagOverrides(ctx context.Context, js jetstream.JetStream, name string, d *schema.ResourceData) error {
+	allowDirect, allowDirectSet := kvBucketConfigBool(d, "allow_direct")
+	denyDelete, denyDeleteSet := kvBucketConfigBool(d, "deny_delete")
+	if !allowDirectSet && !denyDeleteSet {
+		return nil
+	}
+
+	str, err := js.Stream(ctx, fmt.Sprintf("KV_%s", name))
+	if err != nil {
+		return err
+	}
+	info, err := str.Info(ctx)
+	if err != nil {
+		return err
+	}
+	cfg := info.Config
+	changed := false
+	if allowDirectSet && cfg.AllowDirect != allowDirect {
+		cfg.AllowDirect = allowDirect
+		changed = true
+	}
+	if denyDeleteSet && cfg.DenyDelete != denyDelete {
+		cfg.DenyDelete = denyDelete
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	_, err = js.UpdateStream(ctx, cfg)
+	return err
 }
 
 func resourceKVBucketCreate(d *schema.ResourceData, m any) error {
@@ -138,29 +292,6 @@ func resourceKVBucketCreate(d *schema.ResourceData, m any) error {
 	descrption := d.Get("description").(string)
 	limit_marker_ttl := d.Get("limit_marker_ttl").(int)
 
-	var storage jetstream.StorageType
-	switch d.Get("storage").(string) {
-	case "file":
-		storage = jetstream.FileStorage
-	case "memory":
-		storage = jetstream.MemoryStorage
-	}
-
-	var placement *jetstream.Placement
-	c, ok := d.GetOk("placement_cluster")
-	if ok {
-		placement = &jetstream.Placement{Cluster: c.(string)}
-		pt, ok := d.GetOk("placement_tags")
-		if ok {
-			ts := pt.([]any)
-			var tags = make([]string, len(ts))
-			for i, tag := range ts {
-				tags[i] = tag.(string)
-			}
-			placement.Tags = tags
-		}
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -178,18 +309,34 @@ func resourceKVBucketCreate(d *schema.ResourceData, m any) error {
 		}
 	}
 
-	js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
-		Bucket:         name,
-		Description:    descrption,
-		MaxValueSize:   int32(maxV),
-		History:        uint8(history),
-		TTL:            time.Duration(ttl) * time.Second,
-		MaxBytes:       int64(maxB),
-		Storage:        storage,
-		Replicas:       replicas,
-		Placement:      placement,
-		LimitMarkerTTL: time.Duration(limit_marker_ttl) * time.Second,
-	})
+	denyDelete, denyDeleteSet := kvBucketConfigBool(d, "deny_delete")
+	// nats.go CreateKeyValue always sets DenyDelete=true; the server forbids
+	// flipping that to false afterward, so create the backing stream directly.
+	if denyDeleteSet && !denyDelete {
+		_, err = js.CreateStream(ctx, kvBucketStreamConfig(d))
+		if err != nil {
+			return err
+		}
+	} else {
+		_, err = js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+			Bucket:         name,
+			Description:    descrption,
+			MaxValueSize:   int32(maxV),
+			History:        uint8(history),
+			TTL:            time.Duration(ttl) * time.Second,
+			MaxBytes:       int64(maxB),
+			Storage:        kvBucketStorage(d),
+			Replicas:       replicas,
+			Placement:      kvBucketPlacement(d),
+			LimitMarkerTTL: time.Duration(limit_marker_ttl) * time.Second,
+		})
+		if err != nil {
+			return err
+		}
+		if err := applyKVBucketStreamFlagOverrides(ctx, js, name, d); err != nil {
+			return err
+		}
+	}
 
 	d.SetId(fmt.Sprintf("JETSTREAM_KV_%s", name))
 
@@ -247,6 +394,8 @@ func resourceKVBucketRead(d *schema.ResourceData, m any) error {
 	d.Set("max_bucket_size", si.Config.MaxBytes)
 	d.Set("replicas", si.Config.Replicas)
 	d.Set("description", si.Config.Description)
+	d.Set("allow_direct", si.Config.AllowDirect)
+	d.Set("deny_delete", si.Config.DenyDelete)
 
 	if si.Config.Placement != nil {
 		d.Set("placement_cluster", si.Config.Placement.Cluster)
@@ -290,22 +439,15 @@ func resourceKVBucketUpdate(d *schema.ResourceData, m any) error {
 		return err
 	}
 
-	cfg := jetstream.KeyValueConfig{
-		Bucket:         bucket.Bucket(),
-		Description:    str.CachedInfo().Config.Description,
-		MaxValueSize:   str.CachedInfo().Config.MaxMsgSize,
-		History:        uint8(status.History()),
-		TTL:            status.TTL(),
-		MaxBytes:       str.CachedInfo().Config.MaxBytes,
-		Storage:        str.CachedInfo().Config.Storage,
-		Replicas:       str.CachedInfo().Config.Replicas,
-		Placement:      str.CachedInfo().Config.Placement,
-		RePublish:      str.CachedInfo().Config.RePublish,
-		Mirror:         str.CachedInfo().Config.Mirror,
-		Sources:        str.CachedInfo().Config.Sources,
-		Compression:    status.IsCompressed(),
-		LimitMarkerTTL: status.LimitMarkerTTL(),
+	info, err := str.Info(ctx)
+	if err != nil {
+		return err
 	}
+
+	// Start from the live stream config so unmanaged fields (allow_direct,
+	// deny_delete, deny_purge, allow_rollup, discard, compression, republish,
+	// mirror/sources, metadata, duplicates, etc.) are preserved exactly.
+	cfg := info.Config
 
 	history := d.Get("history").(int)
 	ttl := d.Get("ttl").(int)
@@ -313,15 +455,28 @@ func resourceKVBucketUpdate(d *schema.ResourceData, m any) error {
 	maxB := d.Get("max_bucket_size").(int)
 	description := d.Get("description").(string)
 	markerTTL := d.Get("limit_marker_ttl").(int)
+	replicas := d.Get("replicas").(int)
 
-	cfg.History = uint8(history)
-	cfg.TTL = time.Duration(ttl) * time.Second
-	cfg.MaxValueSize = int32(maxV)
-	cfg.MaxBytes = int64(maxB)
 	cfg.Description = description
-	cfg.LimitMarkerTTL = time.Duration(markerTTL) * time.Second
+	cfg.MaxMsgSize = int32(maxV)
+	cfg.MaxMsgsPerSubject = int64(history)
+	cfg.MaxAge = time.Duration(ttl) * time.Second
+	cfg.MaxBytes = int64(maxB)
+	cfg.Replicas = replicas
+	cfg.Placement = kvBucketPlacement(d)
+	cfg.SubjectDeleteMarkerTTL = time.Duration(markerTTL) * time.Second
+	if markerTTL > 0 {
+		cfg.AllowMsgTTL = true
+	}
 
-	_, err = js.CreateOrUpdateKeyValue(ctx, cfg)
+	if v, set := kvBucketConfigBool(d, "allow_direct"); set {
+		cfg.AllowDirect = v
+	}
+	if v, set := kvBucketConfigBool(d, "deny_delete"); set {
+		cfg.DenyDelete = v
+	}
+
+	_, err = js.UpdateStream(ctx, cfg)
 	if err != nil {
 		return err
 	}

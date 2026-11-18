@@ -6,7 +6,7 @@ The `jetstream_kv_bucket` Resource manages JetStream Based Key-Value buckets, su
 
 ```hcl
 resource "jetstream_kv_bucket" "CFG" {
-  name    = "CFG"
+  name = "CFG"
   history = 10
 }
 ```
@@ -23,3 +23,6 @@ resource "jetstream_kv_bucket" "CFG" {
 * `max_value_size` - (optional) Maximum size of any value
 * `max_bucket_size` - (optional) The maximum size of all data in the bucket
 * `replicas` - (optional) How many replicas to keep on a JetStream cluster
+* `limit_marker_ttl` - (optional) Enables per-key TTLs and limit markers; duration in seconds
+* `allow_direct` - (optional, computed) Allow direct get on the backing stream (`$JS.API.DIRECT.GET`). When unset, Terraform preserves the live stream value (KV create defaults to `true`).
+* `deny_delete` - (optional, computed) Restrict deleting messages from the backing stream via the API. When unset, Terraform preserves the live stream value (KV create defaults to `true`). Cannot be changed from `true` to `false` (the NATS server forbids it).
