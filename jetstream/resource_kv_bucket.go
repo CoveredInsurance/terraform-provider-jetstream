@@ -131,6 +131,13 @@ func resourceKVBucket() *schema.Resource {
 				Optional:    true,
 				Computed:    true,
 			},
+			"discard": {
+				Type:             schema.TypeString,
+				Description:      "Discard policy of the backing stream when limits are reached (old or new). When unset, the live stream value is preserved (KV create defaults to new).",
+				Optional:         true,
+				Computed:         true,
+				ValidateDiagFunc: validateDiscardPolicy(),
+			},
 		},
 	}
 }
@@ -175,10 +182,12 @@ type kvBucketStreamUpdate struct {
 	AllowDirectSet bool
 	DenyDelete     bool
 	DenyDeleteSet  bool
+	Discard        jetstream.DiscardPolicy
+	DiscardSet     bool
 }
 
 // mergeKVBucketStreamUpdate copies live, applies TF-managed fields, and only
-// overrides allow_direct / deny_delete when those attributes are set in config.
+// overrides allow_direct / deny_delete / discard when those attributes are set in config.
 func mergeKVBucketStreamUpdate(live jetstream.StreamConfig, u kvBucketStreamUpdate) jetstream.StreamConfig {
 	cfg := live
 	cfg.Description = u.Description
@@ -200,6 +209,9 @@ func mergeKVBucketStreamUpdate(live jetstream.StreamConfig, u kvBucketStreamUpda
 	if u.DenyDeleteSet {
 		cfg.DenyDelete = u.DenyDelete
 	}
+	if u.DiscardSet {
+		cfg.Discard = u.Discard
+	}
 	return cfg
 }
 
@@ -215,6 +227,23 @@ func kvBucketConfigBool(d *schema.ResourceData, key string) (bool, bool) {
 		return false, false
 	}
 	return v.True(), true
+}
+
+// kvBucketConfigDiscard returns the configured discard policy and whether it
+// was set in Terraform configuration (not merely present in state).
+func kvBucketConfigDiscard(d *schema.ResourceData) (jetstream.DiscardPolicy, bool) {
+	raw := d.GetRawConfig()
+	if raw.IsNull() {
+		return jetstream.DiscardNew, false
+	}
+	v := raw.GetAttr("discard")
+	if v.IsNull() || !v.IsKnown() {
+		return jetstream.DiscardNew, false
+	}
+	if v.AsString() == "old" {
+		return jetstream.DiscardOld, true
+	}
+	return jetstream.DiscardNew, true
 }
 
 func kvBucketPlacement(d *schema.ResourceData) *jetstream.Placement {
@@ -245,7 +274,7 @@ func kvBucketStorage(d *schema.ResourceData) jetstream.StorageType {
 }
 
 // kvBucketStreamConfig builds a JetStream stream config matching nats.go KV
-// defaults (ADR-8), then applies explicitly configured allow_direct / deny_delete.
+// defaults (ADR-8), then applies explicitly configured allow_direct / deny_delete / discard.
 func kvBucketStreamConfig(d *schema.ResourceData) jetstream.StreamConfig {
 	name := d.Get("name").(string)
 	history := d.Get("history").(int)
@@ -289,6 +318,9 @@ func kvBucketStreamConfig(d *schema.ResourceData) jetstream.StreamConfig {
 	if v, set := kvBucketConfigBool(d, "deny_delete"); set {
 		scfg.DenyDelete = v
 	}
+	if v, set := kvBucketConfigDiscard(d); set {
+		scfg.Discard = v
+	}
 
 	return scfg
 }
@@ -296,7 +328,8 @@ func kvBucketStreamConfig(d *schema.ResourceData) jetstream.StreamConfig {
 func applyKVBucketStreamFlagOverrides(ctx context.Context, js jetstream.JetStream, name string, d *schema.ResourceData) error {
 	allowDirect, allowDirectSet := kvBucketConfigBool(d, "allow_direct")
 	denyDelete, denyDeleteSet := kvBucketConfigBool(d, "deny_delete")
-	if !allowDirectSet && !denyDeleteSet {
+	discard, discardSet := kvBucketConfigDiscard(d)
+	if !allowDirectSet && !denyDeleteSet && !discardSet {
 		return nil
 	}
 
@@ -316,6 +349,10 @@ func applyKVBucketStreamFlagOverrides(ctx context.Context, js jetstream.JetStrea
 	}
 	if denyDeleteSet && cfg.DenyDelete != denyDelete {
 		cfg.DenyDelete = denyDelete
+		changed = true
+	}
+	if discardSet && cfg.Discard != discard {
+		cfg.Discard = discard
 		changed = true
 	}
 	if !changed {
@@ -445,6 +482,12 @@ func resourceKVBucketRead(d *schema.ResourceData, m any) error {
 	d.Set("description", si.Config.Description)
 	d.Set("allow_direct", si.Config.AllowDirect)
 	d.Set("deny_delete", si.Config.DenyDelete)
+	switch si.Config.Discard {
+	case jetstream.DiscardOld:
+		d.Set("discard", "old")
+	default:
+		d.Set("discard", "new")
+	}
 
 	if si.Config.Placement != nil {
 		d.Set("placement_cluster", si.Config.Placement.Cluster)
@@ -495,6 +538,7 @@ func resourceKVBucketUpdate(d *schema.ResourceData, m any) error {
 
 	allowDirect, allowDirectSet := kvBucketConfigBool(d, "allow_direct")
 	denyDelete, denyDeleteSet := kvBucketConfigBool(d, "deny_delete")
+	discard, discardSet := kvBucketConfigDiscard(d)
 	cfg := mergeKVBucketStreamUpdate(info.Config, kvBucketStreamUpdate{
 		Description:    d.Get("description").(string),
 		MaxMsgSize:     int32(d.Get("max_value_size").(int)),
@@ -508,6 +552,8 @@ func resourceKVBucketUpdate(d *schema.ResourceData, m any) error {
 		AllowDirectSet: allowDirectSet,
 		DenyDelete:     denyDelete,
 		DenyDeleteSet:  denyDeleteSet,
+		Discard:        discard,
+		DiscardSet:     discardSet,
 	})
 
 	_, err = js.UpdateStream(ctx, cfg)
