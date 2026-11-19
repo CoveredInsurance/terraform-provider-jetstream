@@ -26,3 +26,9 @@ resource "jetstream_kv_bucket" "CFG" {
 * `limit_marker_ttl` - (optional) Enables per-key TTLs and limit markers; duration in seconds
 * `allow_direct` - (optional, computed) Allow direct get on the backing stream (`$JS.API.DIRECT.GET`). When unset, Terraform preserves the live stream value (KV create defaults to `true`).
 * `deny_delete` - (optional, computed) Restrict deleting messages from the backing stream via the API. When unset, Terraform preserves the live stream value (KV create defaults to `true`). Cannot be changed from `true` to `false` (the NATS server forbids it).
+* `discard` - (optional, computed) Discard policy of the backing stream when limits are reached: `old` or `new`. When unset, Terraform preserves the live stream value (KV create defaults to `new`).
+
+  Caveats:
+
+  * Combining `discard = "old"` with `max_bucket_size` silently drops the oldest keys when the bucket is full.
+  * Applications whose clients call create-bucket on startup (`nats.go` `CreateKeyValue` / `UpdateKeyValue` / `CreateOrUpdateKeyValue` hard-code `DiscardNew`) will reset the stream to `new`.
