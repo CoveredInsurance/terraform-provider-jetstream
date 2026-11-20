@@ -185,6 +185,62 @@ func TestMergeKVBucketStreamUpdate_UnsetFlagsDoNotClobberLiveTrue(t *testing.T) 
 	}
 }
 
+func TestMergeKVBucketStreamUpdate_DiscardSetOld(t *testing.T) {
+	live := jetstream.StreamConfig{
+		Name:     "KV_TEST",
+		Discard:  jetstream.DiscardNew,
+		Replicas: 1,
+	}
+
+	got := mergeKVBucketStreamUpdate(live, kvBucketStreamUpdate{
+		History:    5,
+		Replicas:   1,
+		Discard:    jetstream.DiscardOld,
+		DiscardSet: true,
+	})
+
+	if got.Discard != jetstream.DiscardOld {
+		t.Errorf("Discard: want DiscardOld override, got %v", got.Discard)
+	}
+}
+
+func TestMergeKVBucketStreamUpdate_DiscardSetNew(t *testing.T) {
+	live := jetstream.StreamConfig{
+		Name:     "KV_TEST",
+		Discard:  jetstream.DiscardOld,
+		Replicas: 1,
+	}
+
+	got := mergeKVBucketStreamUpdate(live, kvBucketStreamUpdate{
+		History:    5,
+		Replicas:   1,
+		Discard:    jetstream.DiscardNew,
+		DiscardSet: true,
+	})
+
+	if got.Discard != jetstream.DiscardNew {
+		t.Errorf("Discard: want DiscardNew override, got %v", got.Discard)
+	}
+}
+
+func TestMergeKVBucketStreamUpdate_DiscardUnsetPreservesLive(t *testing.T) {
+	live := jetstream.StreamConfig{
+		Name:     "KV_TEST",
+		Discard:  jetstream.DiscardOld,
+		Replicas: 1,
+	}
+
+	got := mergeKVBucketStreamUpdate(live, kvBucketStreamUpdate{
+		History:  5,
+		Replicas: 1,
+		// DiscardSet unset → preserve live
+	})
+
+	if got.Discard != jetstream.DiscardOld {
+		t.Errorf("Discard: want preserved DiscardOld, got %v", got.Discard)
+	}
+}
+
 func TestValidateKVBucketDenyDeleteChange(t *testing.T) {
 	t.Parallel()
 

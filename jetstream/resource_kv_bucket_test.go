@@ -85,6 +85,29 @@ resource "jetstream_kv_bucket" "test" {
 }
 `
 
+const testKV_discardUnset = `
+provider "jetstream" {
+  servers = "%s"
+}
+
+resource "jetstream_kv_bucket" "test" {
+  name    = "TEST"
+  storage = "memory"
+}
+`
+
+const testKV_discard = `
+provider "jetstream" {
+  servers = "%s"
+}
+
+resource "jetstream_kv_bucket" "test" {
+  name    = "TEST"
+  storage = "memory"
+  discard = "%s"
+}
+`
+
 func TestResourceKV(t *testing.T) {
 	srv := createJSServer(t)
 	defer srv.Shutdown()
@@ -205,6 +228,106 @@ func TestResourceKVAllowDirectUpdate(t *testing.T) {
 					testBucketExist(t, mgr, "TEST"),
 					testBucketStreamFlags(t, nc, "TEST", false, true),
 					resource.TestCheckResourceAttr("jetstream_kv_bucket.test", "allow_direct", "false"),
+				),
+			},
+		},
+	})
+}
+
+func TestResourceKVBucketDiscard(t *testing.T) {
+	srv := createJSServer(t)
+	defer srv.Shutdown()
+
+	nc, err := nats.Connect(srv.ClientURL())
+	if err != nil {
+		t.Fatalf("could not connect: %s", err)
+	}
+	defer nc.Close()
+
+	mgr, err := jsm.New(nc)
+	if err != nil {
+		t.Fatalf("could not connect: %s", err)
+	}
+
+	resource.Test(t, resource.TestCase{
+		ProtoV5ProviderFactories: testJsProviders,
+		CheckDestroy:             testBucketDoesNotExist(t, mgr, "TEST"),
+		Steps: []resource.TestStep{
+			{
+				Config: fmt.Sprintf(testKV_discardUnset, nc.ConnectedUrl()),
+				Check: resource.ComposeTestCheckFunc(
+					testBucketExist(t, mgr, "TEST"),
+					testBucketDiscard(t, nc, "TEST", jetstream.DiscardNew),
+					resource.TestCheckResourceAttr("jetstream_kv_bucket.test", "discard", "new"),
+				),
+			},
+			{
+				Config:   fmt.Sprintf(testKV_discard, nc.ConnectedUrl(), "new"),
+				PlanOnly: true,
+			},
+			{
+				ResourceName:      "jetstream_kv_bucket.test",
+				ImportState:       true,
+				ImportStateId:     "JETSTREAM_KV_TEST",
+				ImportStateVerify: true,
+			},
+			{
+				Config: fmt.Sprintf(testKV_discard, nc.ConnectedUrl(), "old"),
+				Check: resource.ComposeTestCheckFunc(
+					testBucketExist(t, mgr, "TEST"),
+					testBucketDiscard(t, nc, "TEST", jetstream.DiscardOld),
+					resource.TestCheckResourceAttr("jetstream_kv_bucket.test", "discard", "old"),
+				),
+			},
+			{
+				Config:   fmt.Sprintf(testKV_discardUnset, nc.ConnectedUrl()),
+				PlanOnly: true,
+			},
+			{
+				Config: fmt.Sprintf(testKV_discardUnset, nc.ConnectedUrl()),
+				Check: resource.ComposeTestCheckFunc(
+					testBucketExist(t, mgr, "TEST"),
+					testBucketDiscard(t, nc, "TEST", jetstream.DiscardOld),
+					resource.TestCheckResourceAttr("jetstream_kv_bucket.test", "discard", "old"),
+				),
+			},
+			{
+				Config: fmt.Sprintf(testKV_discard, nc.ConnectedUrl(), "new"),
+				Check: resource.ComposeTestCheckFunc(
+					testBucketExist(t, mgr, "TEST"),
+					testBucketDiscard(t, nc, "TEST", jetstream.DiscardNew),
+					resource.TestCheckResourceAttr("jetstream_kv_bucket.test", "discard", "new"),
+				),
+			},
+		},
+	})
+}
+
+func TestResourceKVBucketDiscardCreateOld(t *testing.T) {
+	srv := createJSServer(t)
+	defer srv.Shutdown()
+
+	nc, err := nats.Connect(srv.ClientURL())
+	if err != nil {
+		t.Fatalf("could not connect: %s", err)
+	}
+	defer nc.Close()
+
+	mgr, err := jsm.New(nc)
+	if err != nil {
+		t.Fatalf("could not connect: %s", err)
+	}
+
+	resource.Test(t, resource.TestCase{
+		ProtoV5ProviderFactories: testJsProviders,
+		CheckDestroy:             testBucketDoesNotExist(t, mgr, "TEST"),
+		Steps: []resource.TestStep{
+			{
+				Config: fmt.Sprintf(testKV_discard, nc.ConnectedUrl(), "old"),
+				Check: resource.ComposeTestCheckFunc(
+					testBucketExist(t, mgr, "TEST"),
+					testBucketDiscard(t, nc, "TEST", jetstream.DiscardOld),
+					resource.TestCheckResourceAttr("jetstream_kv_bucket.test", "discard", "old"),
 				),
 			},
 		},
@@ -522,6 +645,20 @@ func testBucketStreamFlags(t *testing.T, nc *nats.Conn, bucket string, allowDire
 		}
 		if info.Config.DenyDelete != denyDelete {
 			return fmt.Errorf("deny_delete: want %v, got %v", denyDelete, info.Config.DenyDelete)
+		}
+		return nil
+	}
+}
+
+func testBucketDiscard(t *testing.T, nc *nats.Conn, bucket string, want jetstream.DiscardPolicy) resource.TestCheckFunc {
+	t.Helper()
+	return func(s *terraform.State) error {
+		info, err := kvBucketStreamInfo(nc, bucket)
+		if err != nil {
+			return err
+		}
+		if info.Config.Discard != want {
+			return fmt.Errorf("discard: want %v, got %v", want, info.Config.Discard)
 		}
 		return nil
 	}
