@@ -16,6 +16,7 @@ package jetstream
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"testing"
 	"time"
 
@@ -41,6 +42,46 @@ resource "jetstream_kv_bucket" "test" {
   max_value_size = 1024
   max_bucket_size = 10240
   limit_marker_ttl = 45
+}
+`
+
+const testKV_preserveFlags = `
+provider "jetstream" {
+  servers = "%s"
+}
+
+resource "jetstream_kv_bucket" "test" {
+  name         = "TEST"
+  storage      = "memory"
+  history      = %d
+  allow_direct = false
+  deny_delete  = false
+}
+`
+
+const testKV_allowDirect = `
+provider "jetstream" {
+  servers = "%s"
+}
+
+resource "jetstream_kv_bucket" "test" {
+  name         = "TEST"
+  storage      = "memory"
+  history      = 5
+  allow_direct = %t
+}
+`
+
+const testKV_denyDelete = `
+provider "jetstream" {
+  servers = "%s"
+}
+
+resource "jetstream_kv_bucket" "test" {
+  name        = "TEST"
+  storage     = "memory"
+  history     = 5
+  deny_delete = %t
 }
 `
 
@@ -74,12 +115,131 @@ func TestResourceKV(t *testing.T) {
 					resource.TestCheckResourceAttr("jetstream_kv_bucket.test", "max_value_size", "1024"),
 					resource.TestCheckResourceAttr("jetstream_kv_bucket.test", "max_bucket_size", "10240"),
 					resource.TestCheckResourceAttr("jetstream_kv_bucket.test", "limit_marker_ttl", "45"),
+					resource.TestCheckResourceAttr("jetstream_kv_bucket.test", "allow_direct", "true"),
+					resource.TestCheckResourceAttr("jetstream_kv_bucket.test", "deny_delete", "true"),
 				),
 			},
 			{
 				ResourceName:      "jetstream_kv_bucket.test",
 				ImportState:       true,
 				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+func TestResourceKVPreserveStreamFlagsOnUpdate(t *testing.T) {
+	srv := createJSServer(t)
+	defer srv.Shutdown()
+
+	nc, err := nats.Connect(srv.ClientURL())
+	if err != nil {
+		t.Fatalf("could not connect: %s", err)
+	}
+	defer nc.Close()
+
+	mgr, err := jsm.New(nc)
+	if err != nil {
+		t.Fatalf("could not connect: %s", err)
+	}
+
+	resource.Test(t, resource.TestCase{
+		ProtoV5ProviderFactories: testJsProviders,
+		CheckDestroy:             testBucketDoesNotExist(t, mgr, "TEST"),
+		Steps: []resource.TestStep{
+			{
+				Config: fmt.Sprintf(testKV_preserveFlags, nc.ConnectedUrl(), 5),
+				Check: resource.ComposeTestCheckFunc(
+					testBucketExist(t, mgr, "TEST"),
+					testBucketStreamFlags(t, nc, "TEST", false, false),
+					resource.TestCheckResourceAttr("jetstream_kv_bucket.test", "allow_direct", "false"),
+					resource.TestCheckResourceAttr("jetstream_kv_bucket.test", "deny_delete", "false"),
+					resource.TestCheckResourceAttr("jetstream_kv_bucket.test", "history", "5"),
+				),
+			},
+			{
+				// Updating a managed field must not reset allow_direct / deny_delete.
+				Config: fmt.Sprintf(testKV_preserveFlags, nc.ConnectedUrl(), 10),
+				Check: resource.ComposeTestCheckFunc(
+					testBucketExist(t, mgr, "TEST"),
+					testBucketStreamFlags(t, nc, "TEST", false, false),
+					resource.TestCheckResourceAttr("jetstream_kv_bucket.test", "allow_direct", "false"),
+					resource.TestCheckResourceAttr("jetstream_kv_bucket.test", "deny_delete", "false"),
+					resource.TestCheckResourceAttr("jetstream_kv_bucket.test", "history", "10"),
+				),
+			},
+		},
+	})
+}
+
+func TestResourceKVAllowDirectUpdate(t *testing.T) {
+	srv := createJSServer(t)
+	defer srv.Shutdown()
+
+	nc, err := nats.Connect(srv.ClientURL())
+	if err != nil {
+		t.Fatalf("could not connect: %s", err)
+	}
+	defer nc.Close()
+
+	mgr, err := jsm.New(nc)
+	if err != nil {
+		t.Fatalf("could not connect: %s", err)
+	}
+
+	resource.Test(t, resource.TestCase{
+		ProtoV5ProviderFactories: testJsProviders,
+		CheckDestroy:             testBucketDoesNotExist(t, mgr, "TEST"),
+		Steps: []resource.TestStep{
+			{
+				Config: fmt.Sprintf(testKV_allowDirect, nc.ConnectedUrl(), true),
+				Check: resource.ComposeTestCheckFunc(
+					testBucketExist(t, mgr, "TEST"),
+					testBucketStreamFlags(t, nc, "TEST", true, true),
+					resource.TestCheckResourceAttr("jetstream_kv_bucket.test", "allow_direct", "true"),
+				),
+			},
+			{
+				Config: fmt.Sprintf(testKV_allowDirect, nc.ConnectedUrl(), false),
+				Check: resource.ComposeTestCheckFunc(
+					testBucketExist(t, mgr, "TEST"),
+					testBucketStreamFlags(t, nc, "TEST", false, true),
+					resource.TestCheckResourceAttr("jetstream_kv_bucket.test", "allow_direct", "false"),
+				),
+			},
+		},
+	})
+}
+
+func TestResourceKVDenyDeleteTrueToFalseRejected(t *testing.T) {
+	srv := createJSServer(t)
+	defer srv.Shutdown()
+
+	nc, err := nats.Connect(srv.ClientURL())
+	if err != nil {
+		t.Fatalf("could not connect: %s", err)
+	}
+	defer nc.Close()
+
+	mgr, err := jsm.New(nc)
+	if err != nil {
+		t.Fatalf("could not connect: %s", err)
+	}
+
+	resource.Test(t, resource.TestCase{
+		ProtoV5ProviderFactories: testJsProviders,
+		CheckDestroy:             testBucketDoesNotExist(t, mgr, "TEST"),
+		Steps: []resource.TestStep{
+			{
+				Config: fmt.Sprintf(testKV_denyDelete, nc.ConnectedUrl(), true),
+				Check: resource.ComposeTestCheckFunc(
+					testBucketExist(t, mgr, "TEST"),
+					resource.TestCheckResourceAttr("jetstream_kv_bucket.test", "deny_delete", "true"),
+				),
+			},
+			{
+				Config:      fmt.Sprintf(testKV_denyDelete, nc.ConnectedUrl(), false),
+				ExpectError: regexp.MustCompile(`deny_delete cannot be changed from true to false`),
 			},
 		},
 	})
@@ -348,4 +508,36 @@ func TestResourceKVUpdateKeepsUnmanagedSettings(t *testing.T) {
 			},
 		},
 	})
+}
+
+func testBucketStreamFlags(t *testing.T, nc *nats.Conn, bucket string, allowDirect, denyDelete bool) resource.TestCheckFunc {
+	t.Helper()
+	return func(s *terraform.State) error {
+		info, err := kvBucketStreamInfo(nc, bucket)
+		if err != nil {
+			return err
+		}
+		if info.Config.AllowDirect != allowDirect {
+			return fmt.Errorf("allow_direct: want %v, got %v", allowDirect, info.Config.AllowDirect)
+		}
+		if info.Config.DenyDelete != denyDelete {
+			return fmt.Errorf("deny_delete: want %v, got %v", denyDelete, info.Config.DenyDelete)
+		}
+		return nil
+	}
+}
+
+func kvBucketStreamInfo(nc *nats.Conn, bucket string) (*jetstream.StreamInfo, error) {
+	js, err := jetstream.New(nc)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	str, err := js.Stream(ctx, "KV_"+bucket)
+	if err != nil {
+		return nil, err
+	}
+	return str.Info(ctx)
 }
